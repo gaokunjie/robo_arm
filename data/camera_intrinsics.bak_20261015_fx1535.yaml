@@ -1,0 +1,22 @@
+%YAML:1.0
+---
+image_width: 1920
+image_height: 1080
+rms_px: 4.8779350551455553e-01
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1.5350203097228919e+03, 0., 9.5353139524864594e+02, 0.,
+       1.5470083126378508e+03, 5.9515359805236631e+02, 0., 0., 1. ]
+dist_coeffs: !!opencv-matrix
+   rows: 1
+   cols: 5
+   dt: d
+   data: [ 2.3840125958160127e-01, -6.2862416182536107e-01,
+       4.2139913250143829e-03, -2.8977316933953741e-04,
+       7.2838676205966835e-01 ]
+views: 156
+board_square_mm: 25.
+date: "2026-10-15 17:23:59"
+source_dir: "data/calib_shots_第二批 + data/calib_shots_第三批 + data/calib_shots_第五批 + data/calib_shots"

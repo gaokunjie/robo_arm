@@ -1,0 +1,6 @@
+来源: https://gitee.com/fair-innovation/fairino-python-sdk (linux/fairino/Robot.py, master)
+下载日期: 2026-10-14
+说明: 纯 Python 实现, xmlrpc 连接 机器人IP:20003。未使用 Cython 编译版。
+
+本地补丁: 2026-10-14 把顶层 mbedtls 导入改为可缺省(见 Robot.py 第25行附近), 否则未装
+python-mbedtls 时整个 SDK 无法 import。未使用加密通信(tls_enable=False), 无影响。

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地工具 / 编辑器
+.claude/
+.vscode/
+.idea/
+*.swp
+
+# 运行期生成物
+*.log
+FR_RPC_LOG*
+data/*.tmp
+data/fk_cache.*.tmp
+
+# OS
+.DS_Store

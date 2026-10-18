@@ -1,0 +1,94 @@
+{
+ "r0_mm": 36.8,
+ "n_all": 4,
+ "n_det": 4,
+ "n_reject": 0,
+ "method": "solvePnP + 柱面模型",
+ "per_det": [
+  {
+   "tag": "home",
+   "id": 1,
+   "depth_mm": 262.7,
+   "pnp_rms_px": 0.23,
+   "tilt_deg": 5.1,
+   "resid_mm": 0.54,
+   "Pb": [
+    23.6,
+    -388.6,
+    391.1
+   ],
+   "used": true,
+   "why": ""
+  },
+  {
+   "tag": "tap2+4",
+   "id": 1,
+   "depth_mm": 260.0,
+   "pnp_rms_px": 0.35,
+   "tilt_deg": 6.3,
+   "resid_mm": -0.16,
+   "Pb": [
+    22.1,
+    -387.0,
+    391.4
+   ],
+   "used": true,
+   "why": ""
+  },
+  {
+   "tag": "tap5+4",
+   "id": 1,
+   "depth_mm": 258.1,
+   "pnp_rms_px": 0.49,
+   "tilt_deg": 5.6,
+   "resid_mm": 0.22,
+   "Pb": [
+    23.5,
+    -388.2,
+    390.8
+   ],
+   "used": true,
+   "why": ""
+  },
+  {
+   "tag": "tap2-4",
+   "id": 1,
+   "depth_mm": 264.3,
+   "pnp_rms_px": 0.44,
+   "tilt_deg": 5.2,
+   "resid_mm": -0.61,
+   "Pb": [
+    24.5,
+    -387.8,
+    391.7
+   ],
+   "used": true,
+   "why": ""
+  }
+ ],
+ "tilt_deg": 5.398685712606662,
+ "tilt_max_deg": 6.316871055219241,
+ "n_normals": 4,
+ "axis_xy_normal": [
+  32.04291391609153,
+  -423.8506007488054
+ ],
+ "normal_spread_mm": 0.7831922104167821,
+ "normal_spread_max_mm": 1.5807516961814618,
+ "radial_spread_deg": 171.1263421794804,
+ "axis_xy_circle": [
+  41.15815235969439,
+  -355.69668365502275
+ ],
+ "axis_xy": [
+  32.04291391609153,
+  -423.8506007488054
+ ],
+ "z_markers": 391.2651554466721,
+ "rms_mm": 0.42827491860523265,
+ "max_resid_mm": 0.6066349719915536,
+ "n_trim": 0,
+ "implied_table_z": 351.2651554466721,
+ "cand_spread_mm": 2.5162705647381856,
+ "pass": true
+}

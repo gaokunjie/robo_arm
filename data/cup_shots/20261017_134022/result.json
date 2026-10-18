@@ -1,0 +1,109 @@
+{
+ "r0_mm": 36.8,
+ "n_all": 5,
+ "n_det": 5,
+ "n_reject": 0,
+ "method": "solvePnP + 柱面模型",
+ "per_det": [
+  {
+   "tag": "home",
+   "id": 1,
+   "depth_mm": 326.0,
+   "pnp_rms_px": 0.36,
+   "tilt_deg": 3.3,
+   "resid_mm": 0.34,
+   "Pb": [
+    9.0,
+    -510.0,
+    365.5
+   ],
+   "used": true,
+   "why": ""
+  },
+  {
+   "tag": "tap2+4",
+   "id": 1,
+   "depth_mm": 320.9,
+   "pnp_rms_px": 0.06,
+   "tilt_deg": 3.0,
+   "resid_mm": -0.91,
+   "Pb": [
+    9.8,
+    -511.2,
+    365.4
+   ],
+   "used": true,
+   "why": ""
+  },
+  {
+   "tag": "tap5+4",
+   "id": 1,
+   "depth_mm": 331.8,
+   "pnp_rms_px": 0.25,
+   "tilt_deg": 4.1,
+   "resid_mm": -0.53,
+   "Pb": [
+    8.8,
+    -510.9,
+    364.3
+   ],
+   "used": true,
+   "why": ""
+  },
+  {
+   "tag": "tap2-4",
+   "id": 1,
+   "depth_mm": 332.9,
+   "pnp_rms_px": 0.35,
+   "tilt_deg": 4.3,
+   "resid_mm": 1.09,
+   "Pb": [
+    8.4,
+    -509.4,
+    365.4
+   ],
+   "used": true,
+   "why": ""
+  },
+  {
+   "tag": "tap2-4",
+   "id": 1,
+   "depth_mm": 346.8,
+   "pnp_rms_px": 0.66,
+   "tilt_deg": 3.4,
+   "resid_mm": 0.03,
+   "Pb": [
+    40.1,
+    -520.5,
+    363.6
+   ],
+   "used": true,
+   "why": ""
+  }
+ ],
+ "tilt_deg": 3.3958671468936705,
+ "tilt_max_deg": 4.317600221753326,
+ "n_normals": 5,
+ "axis_xy_normal": [
+  17.64822127568363,
+  -546.6608355738663
+ ],
+ "normal_spread_mm": 1.3027113146672522,
+ "normal_spread_max_mm": 3.4036708875112325,
+ "radial_spread_deg": 168.646010711514,
+ "axis_xy_circle": [
+  14.328011103268784,
+  -546.7874764570101
+ ],
+ "axis_xy": [
+  17.64822127568363,
+  -546.6608355738663
+ ],
+ "z_markers": 365.351357032463,
+ "rms_mm": 0.696959501529307,
+ "max_resid_mm": 1.0926733854100448,
+ "n_trim": 0,
+ "implied_table_z": 325.351357032463,
+ "cand_spread_mm": 33.632628986929355,
+ "pass": true
+}
