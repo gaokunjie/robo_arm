@@ -282,17 +282,52 @@ def staged(arm, fc, fk6, lim, q_cur, p_target, R_target, tree, cup, label, dry, 
     return q_cur
 
 
-def wait_move(arm, timeout=180.0, start_win=4.0):
+def staged_gen(fc, fk6, q_cur, p_target, R_target, tree, cup, label):
+    """【流式规划生成器】——与 staged(dry=True) 同一算法，但不执行、不打印，逐点 yield。
+
+    next() 得到一个子航点 dict（字段同 trace 项：label/q/pose/seg_clear）；消耗完即整段航点。
+    供【流水线】用：执行上一段的同时，用本生成器规划下一段 —— 单连接、单线程安全，
+    因为运动只走 :20003 下发、到位靠 :8083 轮询，运动期间 :20003 空闲可发 FK 查询。
+
+    ⚠ FK 调用序列与 staged 完全一致（fc.T 一次 + solve_delta），否则拿不到缓存命中。
+    """
+    T0 = fc.T(q_cur)
+    p0, R0 = T0[:3, 3].copy(), T0[:3, :3].copy()
+    p_target = np.asarray(p_target, float)
+    dpos = float(np.linalg.norm(p_target - p0))
+    dang = float(np.degrees(Rot.from_matrix(R_target @ R0.T).magnitude()))
+    n = max(1, int(np.ceil(dpos / STEP_MM)), int(np.ceil(dang / ANG_STEP)))
+    sl = Slerp([0, 1], Rot.from_matrix(np.stack([R0, R_target])))
+    for i in range(1, n + 1):
+        s = i / n
+        pt = p0 + s * (p_target - p0)
+        Rt = sl(s).as_matrix()
+        Tcu = fc.T(q_cur)
+        dp = pt - Tcu[:3, 3]
+        drot = M.rotvec_deg(Rt @ Tcu[:3, :3].T)
+        seg_min = seg_clearance(Tcu[:3, 3], pt, Tcu[:3, :3], Rt, tree, cup)
+        q_cur = np.asarray(M.solve_delta(fk6, q_cur, dp=dp, drot=drot, steps=3, iters=12,
+                                         tol_pos=0.01, tol_ang=0.01)["q"], float)
+        yield {"label": f"{label} [{i}/{n}]", "q": q_cur.tolist(),
+               "pose": list(fc.pose(q_cur)), "seg_clear": round(seg_min, 2)}
+
+
+def wait_move(arm, timeout=180.0, start_win=4.0, pump=None):
     """等运动【真正完成】：先确认已启动（motion_done→0 或关节开始动），再等关节连续稳定 1s。
 
     ⚠ 不能用 arm.wait_done()/fr_state.wait_motion_done：它只看 motion_done==1，指令刚下发
       一瞬该字段仍是上次的 1 ⇒ 立刻返回 ⇒ 下一条指令撞进正在跑的 MoveJ（错误码 6，只能断电）。
+
+    pump：可选的「空档回调」。运动期间 :20003 空闲（运动只走 :20003 下发、到位靠 :8083 轮询），
+       循环每轮调用一次 pump()，供【流水线】在等运动时推进下一段的规划（单连接、单线程安全）。
     """
     st = arm.st
     t0 = time.time()
     started = False
     prev = None
     while time.time() - t0 < start_win:
+        if pump is not None:
+            pump()
         q = np.asarray(st.joints, float)
         if int(st.motion_done) == 0 or (prev is not None and float(np.max(np.abs(q - prev))) > 0.05):
             started = True
@@ -302,6 +337,8 @@ def wait_move(arm, timeout=180.0, start_win=4.0):
     stable = 0.0
     prev = None
     while time.time() - t0 < timeout:
+        if pump is not None:
+            pump()
         q = np.asarray(st.joints, float)
         if prev is not None and float(np.max(np.abs(q - prev))) < 0.02:
             stable += 0.2
@@ -318,17 +355,22 @@ def wait_move(arm, timeout=180.0, start_win=4.0):
     return False
 
 
-def replay(arm, lim, plan, start=0, upto=None):
+def replay(arm, lim, plan, start=0, upto=None, times=None, pump=None, quiet=False):
     """【零 FK 回放】把一个算好的关节航点序列纯执行下去。
 
     —— 绕开控制器崩溃的要点：位姿随航点存好、直接喂 move_j（否则 fr_arm.move_j
        内部会再调一次 FK）；本阶段绝不再查正解。
     start/upto：只回放 [start, upto) 区间的航点（0 基、不含 upto）。upto=None 跑到头。
        用途：先 --upto=2 只走 ①→②（万向锁崩点）验证不崩，再 --from=2 续跑。
+    times：可选 list；每个航点 append `(idx, 该航点耗时s)`（= move_j 下发 → wait_move
+       到位，不含 0.4s 整定）。给调用方做「规划 vs 运动」计时用。
+    pump：可选回调，透传 wait_move；供流水线在等运动时推进下一段规划。
+    quiet：True 时不打印段末提示（流水线逐段回放时用）。
     """
     way = plan["waypoints"]
     end = len(way) if upto is None else min(int(upto), len(way))
-    print(f"回放航点 [{start}, {end}) / 共 {len(way)} —— 零 FK 模式")
+    if not quiet:
+        print(f"回放航点 [{start}, {end}) / 共 {len(way)} —— 零 FK 模式")
     if start == 0:
         arm.enable()
         time.sleep(0.3)
@@ -348,11 +390,14 @@ def replay(arm, lim, plan, start=0, upto=None):
         bad = guard_pose6(w["pose"], f"航点 #{idx}")
         if bad:
             sys.exit(bad)
+        t_send = time.time()
         arm.r.move_j([float(x) for x in q], [float(x) for x in w["pose"]],
                      config.TOOL_ID, config.USER_ID, SPEED_PCT,
                      config.MAX_ACC_PCT, 100.0, 0.0)
-        if not wait_move(arm, 120):
+        if not wait_move(arm, 120, pump=pump):
             sys.exit(f"✗ 航点 #{idx} 等待到位超时，停在原地（别再发下一条！）")
+        if times is not None:
+            times.append((idx, time.time() - t_send))
         time.sleep(0.4)
         qa = np.asarray(arm.joint_deg(), float)
         dj = float(np.max(np.abs(qa - q)))
@@ -360,6 +405,8 @@ def replay(arm, lim, plan, start=0, upto=None):
               f"错误码 {arm.errors()}", flush=True)
         if dj > 0.5:
             sys.exit(f"✗ 航点 #{idx} 到位关节差 {dj:.3f}° 过大，停")
+    if quiet:
+        return
     if end < len(way):
         print(f"\n■ 已按 --upto 停在航点 #{end}（未到插入位）。"
               f"目视无误后继续：--replay=... --from={end}")
