@@ -154,7 +154,9 @@ def _ray_plane_xy(o, d, z):
 MARKER_UP_LOCAL_AXIS = 1        # 实测（2026-10-17 存量帧）：码局部【Y】轴 ≈ 竖直 = 杯轴方向
                                   # 局部 Y 的 z 分量 ≈ −0.997；符号随贴码朝向，取反成向上
 # ⚠ 曾误判为局部 X（因 arcsin(≈0) 误读成"≈竖直"，实为"水平"），已修正
-PNP_RMS_GATE_PX = 1.0          # solvePnP 重投影 RMS 闸（实测真码 0.10~0.49px）
+PNP_RMS_GATE_PX = 1.2          # solvePnP 重投影 RMS 闸（实测真码 0.10~0.49px）
+                               # 248 观察高度远侧码实测 0.77~1.03px（上一轮 0.95 过、本轮
+                               # 1.02 卡线）；18:24 刮杯轮的问题簇是 1.31~1.4px ⇒ 1.2 仍能挡住。
 PNP_RMS_GATE_PX_DIR = 3.0      # 直线交点法的【仅方向】闸：位置/深度精度要求可放宽，方向仍稳
                                #   实测：2.91px 的码位置偏 ~3.8mm，但方向可用，且独供一个方位角
                                #   ⇒ 若按 1.0px 剔掉它，剩码方位重合、交点病态漂 2.5mm
@@ -168,6 +170,11 @@ PNP_LINE_SPREAD_MIN_DEG = 30.0 # 验收闸②（主·条件数）：各码径向
                                #   垂距小 ≠ 交点稳：两线近乎平行时交点也"看似自洽"却病态。
                                #   实测教训：3 枚码里两枚方位差 0.3°（几乎平行），交点漂 2.5mm；
                                #   补上第 3 个方位（158°）后张角 ~120°、交点稳定。取 30° 为下限。
+PNP_AZ_CLUSTER_DEG = 15.0       # 同方位聚类容差：码法线方位差 < 15° 视为【同一枚物理码】的重复帧
+                                #   为什么必须聚类：杯上 6 枚码全是 ID 1，跨帧不能按 ID 配对；
+                                #   同一枚码在相邻 J1 会被反复检出，若按帧计票，单枚码的重复帧
+                                #   会压过另一方位，并把该码的位置噪声（实测跨帧散 12mm）带进交点。
+                                #   实测：18:24 那轮 5 帧其实只有 2 枚物理码（方位 61°/119°）。
 PNP_NORMAL_SPREAD_PASS_MM = 8.0  # 信息项（交叉核对，不拦）：点法各码独立算出的杯轴散布
                                   #   ⚠ 为什么不能用它在线标定 R（试过了，不行，别再试）：
                                   #     单次采集里可读的码全挤在 ~30mm 内（方位几乎相同），
@@ -247,6 +254,58 @@ def axis_from_marker_normals(recs, R, camera_xy=None):
                     "norm_tilt_deg": float(np.degrees(np.arccos(
                         np.clip(-c["Rb"][2, 2], -1, 1))))})
     return [o for o in out if o is not None]
+
+
+def cluster_direction_recs(recs, tol_deg=PNP_AZ_CLUSTER_DEG):
+    """按【码法线方位】把方向可用检测聚类 → 每个方位簇一个代表。
+
+    为什么（2026-10-19 18:24 实锤）：杯上 6 枚码全 ID 1，跨帧不能按 ID 配对。
+    同一枚物理码在相邻 J1 被反复检出（5 帧只对应 2 枚物理码），旧逻辑按帧计票：
+      · 这枚码的重复帧会把它的位置噪声（同码跨帧散 12mm）带进直线交点；
+      · 且"精度可用 2 枚"其实可能是同一枚码的两帧 —— 方位没铺开，交点照样病态。
+    代表 = 同向对齐后的水平法线单位化平均 + Pb 逐轴中位数（抗单帧深度跳变）。
+    返回的每个代表保留 Rb 字段（供 axis_from_marker_lines 复用）。
+    """
+    clusters = []
+    for c in recs:
+        nh = np.array([c["Rb"][0, 2], c["Rb"][1, 2]], float)
+        nn = float(np.linalg.norm(nh))
+        if nn < 1e-9:
+            continue
+        nh = nh / nn
+        az = float(np.degrees(np.arctan2(nh[1], nh[0])) % 180.0)
+        for cl in clusters:
+            d = abs(az - cl["az"])
+            d = min(d, 180.0 - d)
+            if d >= tol_deg:
+                continue
+            if float(nh @ cl["n_sum"]) < 0:      # 法线符号可翻转，先对齐再平均
+                nh = -nh
+            cl["n_sum"] = cl["n_sum"] + nh
+            cl["members"].append(c)
+            s = cl["n_sum"]
+            cl["az"] = float(np.degrees(np.arctan2(s[1], s[0])) % 180.0)
+            break
+        else:
+            clusters.append({"az": az, "n_sum": nh.copy(), "members": [c]})
+
+    out = []
+    for cl in clusters:
+        s = cl["n_sum"]
+        n = float(np.linalg.norm(s))
+        if n < 1e-9:
+            continue
+        nh = s / n
+        P = np.array([m["Pb"] for m in cl["members"]], float)
+        Pb = np.median(P, axis=0)
+        Rb = np.eye(3)
+        Rb[0, 2], Rb[1, 2] = nh
+        best = min(cl["members"], key=lambda m: m["pnp_rms_px"])
+        out.append({"tag": best["tag"], "id": best["id"], "Pb": Pb, "Rb": Rb,
+                    "n_h": nh, "members": cl["members"], "n_views": len(cl["members"]),
+                    "az_deg": float(np.degrees(np.arctan2(nh[1], nh[0])) % 180.0),
+                    "pnp_rms_px": best["pnp_rms_px"]})
+    return out
 
 
 def axis_from_marker_lines(recs):
@@ -357,19 +416,37 @@ def solve_pnp(shots, K=None, D=None, X=None, say=print, r0=None):
     if good_dir:
         res["tilt_deg"] = float(np.median([c["tilt_deg"] for c in good_dir]))
         res["tilt_max_deg"] = float(max(c["tilt_deg"] for c in good_dir))
-    if len(good) < 2:
-        res["error"] = (f"精度可用码 {len(good)} 枚 <2（共检出 {len(cand)}，"
-                        f"方向可用 {len(good_dir)}）——解不出杯轴（挪观察位/确认码在视野里）")
+    # ⚠ 可解性 = 【≥2 个不同方位的物理码】（聚类后计，不按帧计）：
+    #   · 直线交点法只用方向，R/δ 与深度精度无关 ⇒ 精度集(good)只做交叉核对；
+    #   · 但同一枚码被拍多帧 ≠ 两个方位（2026-10-19 18:24：5 帧其实只有 2 枚码，
+    #     且其中一簇只有大倾角帧时轴会偏 ~5mm）⇒ 必须按方位聚类，并要求每簇里
+    #     至少有一帧过精度闸；否则宁可停在观察位，也不拿偏轴去套杯。
+    clusters = cluster_direction_recs(good_dir)
+    good_tags = {id(c) for c in good}
+    precise = [cl for cl in clusters if any(id(m) in good_tags for m in cl["members"])]
+    res["n_clusters"] = len(clusters)
+    res["n_precise_clusters"] = len(precise)
+    res["cluster_views"] = [cl["n_views"] for cl in clusters]
+    if len(precise) < 2:
+        res["error"] = (f"不同方位的精度码 {len(precise)} 簇 <2"
+                        f"（方向可用 {len(good_dir)} 帧 → {len(clusters)} 簇，"
+                        f"精度可用 {len(good)} 帧）——解不出杯轴"
+                        f"（挪观察位/让杯码正对相机）")
         for c in cand:
-            res["per_det"].append({"tag": c["tag"], "id": c["id"],
-                                   "why": c["why"] or "样本不足"})
+            if c["why_dir"]:
+                why = c["why_dir"]
+            elif c["why"]:
+                why = c["why"] + "（方向可用，但该方位没有精度帧）"
+            else:
+                why = "精度可用（同方位重复帧，未形成第 2 个方位簇）"
+            res["per_det"].append({"tag": c["tag"], "id": c["id"], "why": why})
         return res
 
-    P = np.array([c["Pb"] for c in good])
     # ---- 主估计器 A【首选】：码法线径向直线的 LS 交点（对 R/δ 双免疫） ----
-    cam_xy = float(np.median([c["Pb"][0] for c in good_dir])), float(
-        np.median([c["Pb"][1] for c in good_dir]))
-    lines, a_line = axis_from_marker_lines(good_dir)
+    # 每簇只取一个代表（同簇重复帧已合并），避免单枚码多帧"刷票"。
+    # 只用【含精度帧】的方位簇：18:24 的刮杯事故里第 2 簇只有 1.3~1.4px 的大倾角帧，
+    # 其法线把轴拽偏 ~5mm；现在这种"凑不出 2 个正对相机的方位"会直接停在观察位。
+    lines, a_line = axis_from_marker_lines(precise)
     res["n_lines"] = len(lines)
     if a_line is not None:
         dl = np.array([l["line_dist"] for l in lines])
@@ -380,68 +457,92 @@ def solve_pnp(shots, K=None, D=None, X=None, say=print, r0=None):
         res["line_spread_deg"] = float(max(
             (min(abs(az[i] - az[j]), 180.0 - abs(az[i] - az[j])))
             for i in range(len(az)) for j in range(i + 1, len(az)))) if len(az) > 1 else 0.0
-    # ---- 交叉核对 B：法线点法（Pb − R·n̂，对 R/δ 敏感，仅参考） ----
-    nrm = axis_from_marker_normals(good, R, None)
-    res["n_normals"] = len(nrm)
-    if nrm:
-        A = np.array([n["axis"] for n in nrm])
-        a_norm = np.median(A, axis=0)
-        spread = np.linalg.norm(A - a_norm, axis=1)
-        res["axis_xy_normal"] = (float(a_norm[0]), float(a_norm[1]))
-        res["normal_spread_mm"] = float(np.median(spread))
-        res["normal_spread_max_mm"] = float(spread.max())
-        res["radial_spread_deg"] = float(max(
-            abs((n["radial_deg"] - a + 180) % 360 - 180)
-            for n in nrm for a in (float(np.degrees(np.arctan2(a_norm[1], a_norm[0]))),)))
-    # ---- 交叉核对：圆心拟合（放大 28×，只当质量指标，不当结果） ----
-    keep = list(range(len(good)))
-    start = np.array([float(np.median(P[:, 0])), float(np.median(P[:, 1]))])
-    a = _fit_vertical_axis(P[keep, :2], r0, start)
-    for _round in range(3):                                 # 迭代剔野
+
+    zm = float(np.median([c["Pb"][2] for c in good_dir]))
+    rms = float("nan")
+    max_resid = float("nan")
+    n_trim = 0
+
+    if len(good) >= 2:
+        P = np.array([c["Pb"] for c in good])
+        # ---- 交叉核对 B：法线点法（Pb − R·n̂，对 R/δ 敏感，仅参考） ----
+        nrm = axis_from_marker_normals(good, R, None)
+        res["n_normals"] = len(nrm)
+        if nrm:
+            A = np.array([n["axis"] for n in nrm])
+            a_norm = np.median(A, axis=0)
+            spread = np.linalg.norm(A - a_norm, axis=1)
+            res["axis_xy_normal"] = (float(a_norm[0]), float(a_norm[1]))
+            res["normal_spread_mm"] = float(np.median(spread))
+            res["normal_spread_max_mm"] = float(spread.max())
+            res["radial_spread_deg"] = float(max(
+                abs((n["radial_deg"] - a + 180) % 360 - 180)
+                for n in nrm for a in (float(np.degrees(np.arctan2(a_norm[1], a_norm[0]))),)))
+        # ---- 交叉核对：圆心拟合（放大 28×，只当质量指标，不当结果） ----
+        keep = list(range(len(good)))
+        start = np.array([float(np.median(P[:, 0])), float(np.median(P[:, 1]))])
+        a = _fit_vertical_axis(P[keep, :2], r0, start)
+        for _round in range(3):                             # 迭代剔野
+            rad = np.hypot(P[keep, 0] - a[0], P[keep, 1] - a[1]) - r0
+            rms = float(np.sqrt((rad ** 2).mean()))
+            mad = float(np.median(np.abs(rad)))
+            if mad <= 1e-6:
+                break
+            worst = int(np.argmax(np.abs(rad)))
+            if abs(rad[worst]) <= PNP_TRIM_SIGMA * mad:
+                break
+            keep.pop(worst)
+            if len(keep) < 2:
+                keep.append(worst)
+                break
+            a = _fit_vertical_axis(P[keep, :2], r0, a)
+
         rad = np.hypot(P[keep, 0] - a[0], P[keep, 1] - a[1]) - r0
         rms = float(np.sqrt((rad ** 2).mean()))
-        mad = float(np.median(np.abs(rad)))
-        if mad <= 1e-6:
-            break
-        worst = int(np.argmax(np.abs(rad)))
-        if abs(rad[worst]) <= PNP_TRIM_SIGMA * mad:
-            break
-        keep.pop(worst)
-        if len(keep) < 2:
-            keep.append(worst)
-            break
-        a = _fit_vertical_axis(P[keep, :2], r0, a)
+        max_resid = float(np.abs(rad).max())
+        zm = float(np.median(P[keep, 2]))
+        n_trim = len(good) - len(keep)
+        res["axis_xy_circle"] = (float(a[0]), float(a[1]))
+        for i, c in enumerate(good):
+            r = float(np.hypot(c["Pb"][0] - a[0], c["Pb"][1] - a[1]) - r0)
+            res["per_det"].append({
+                "tag": c["tag"], "id": c["id"], "depth_mm": round(c["depth"], 1),
+                "pnp_rms_px": round(c["pnp_rms_px"], 2),
+                "tilt_deg": round(c["tilt_deg"], 1),
+                "resid_mm": round(r, 2),
+                "Pb": [round(float(v), 1) for v in c["Pb"]],
+                "used": i in keep,
+                "why": "" if i in keep else f"剔野（径向残差 {r:+.2f}mm）"})
+    else:
+        res["note"] = "精度可用码 <2：跳过点法/圆心法交叉核对（主结果 = 直线交点法）"
+        for c in good:
+            res["per_det"].append({
+                "tag": c["tag"], "id": c["id"], "depth_mm": round(c["depth"], 1),
+                "pnp_rms_px": round(c["pnp_rms_px"], 2),
+                "tilt_deg": round(c["tilt_deg"], 1),
+                "Pb": [round(float(v), 1) for v in c["Pb"]],
+                "used": True, "why": ""})
 
-    rad = np.hypot(P[keep, 0] - a[0], P[keep, 1] - a[1]) - r0
-    rms = float(np.sqrt((rad ** 2).mean()))
-    zm = float(np.median(P[keep, 2]))
-    dropped = [i for i in range(len(good)) if i not in keep]
-    for i, c in enumerate(good):
-        r = float(np.hypot(c["Pb"][0] - a[0], c["Pb"][1] - a[1]) - r0)
-        res["per_det"].append({
-            "tag": c["tag"], "id": c["id"], "depth_mm": round(c["depth"], 1),
-            "pnp_rms_px": round(c["pnp_rms_px"], 2),
-            "tilt_deg": round(c["tilt_deg"], 1),
-            "resid_mm": round(r, 2),
-            "Pb": [round(float(v), 1) for v in c["Pb"]],
-            "used": i in keep,
-            "why": "" if i in keep else f"剔野（径向残差 {r:+.2f}mm）"})
+    if a_line is None:
+        res["error"] = (f"方向可用码 {len(good_dir)} 枚但直线交点病态/失败"
+                        f"——解不出杯轴（挪观察位/确认码在视野里）")
+        for c in cand:
+            if c["why"] or c["why_dir"]:
+                res["per_det"].append({"tag": c["tag"], "id": c["id"],
+                                       "why": c["why_dir"] or c["why"]})
+        return res
+
     for c in cand:
         if c["why"]:
             why = c["why"]
             if not c.get("why_dir"):        # 位置不达标但方向可用 → 直线交点法仍采用
                 why += "（方向仍用于直线交点）"
             res["per_det"].append({"tag": c["tag"], "id": c["id"], "why": why})
-    res["axis_xy_circle"] = (float(a[0]), float(a[1]))
-    final = (res.get("axis_xy_line")
-             or res.get("axis_xy_normal")
-             or (float(a[0]), float(a[1])))
+    final = a_line
+
     res.update(axis_xy=final, z_markers=zm, rms_mm=rms,
-               max_resid_mm=float(np.abs(rad).max()), n_trim=len(dropped),
-               implied_table_z=zm - config.MARKER_Z_ABOVE_TABLE,
-               cand_spread_mm=float(max(
-                   np.linalg.norm(P[keep][i] - P[keep][j])
-                   for i in range(len(keep)) for j in range(len(keep)))) if len(keep) > 1 else 0.0)
+               max_resid_mm=max_resid, n_trim=n_trim,
+               implied_table_z=zm - config.MARKER_Z_ABOVE_TABLE)
     # 验收（2026-10-19 重定，与主估计器=直线交点法一致）：
     #   ① 直线交点垂距（几何一致性） ② 各码方向张角（条件数，防"平行线假自洽"） ③ 杯轴倾角
     #   径向残差 RMS / 点法散布降为【信息项】：它们量的是圆心拟合轴（本题几何下放大 28×、
@@ -466,6 +567,10 @@ def report_pnp(res, say=print):
     say(f"方法 {res['method']}   精度可用 {res['n_det']}/{res['n_all']} 枚"
         f"（预处理剔 {res['n_reject']}，迭代剔野 {res['n_trim']}）"
         f"   方向可用 {res.get('n_dir', res['n_det'])} 枚（直线交点法用）")
+    if "n_clusters" in res:
+        say(f"方位聚类 {res['n_clusters']} 簇（各簇帧数 {res.get('cluster_views')}）"
+            f"  其中含精度帧的 {res.get('n_precise_clusters', 0)} 簇"
+            f"（可解性要求 ≥2）")
     say(f"半径固定 r0 = {res['r0_mm']:.2f} mm（卡尺 + 杯轮廓算出 ⇒ 残差无自由参数）")
     say(f"{'帧':<14}{'ID':>3}{'视距':>7}{'PnPpx':>7}{'倾角':>7}"
         f"{'基座系xyz':>26}{'径向残差':>9}  用")
@@ -473,9 +578,11 @@ def report_pnp(res, say=print):
         if "why" in p and not p.get("Pb"):
             say(f"{p['tag']:<14}{p['id']:>3}  —— 剔除：{p['why']}")
             continue
+        resid = f"{p['resid_mm']:>+9.2f}" if "resid_mm" in p else f"{'—':>9}"
+        used = '✓' if p.get("used") else '✗ ' + p.get("why", "")
         say(f"{p['tag']:<14}{p['id']:>3}{p['depth_mm']:>7.0f}{p['pnp_rms_px']:>7.2f}"
             f"{p['tilt_deg']:>7.1f}  ({p['Pb'][0]:>7.1f},{p['Pb'][1]:>8.1f},{p['Pb'][2]:>7.1f})"
-            f"{p['resid_mm']:>+9.2f}  {'✓' if p['used'] else '✗ ' + p['why']}")
+            f"{resid}  {used}")
     say(f"\n★ 杯轴 xy（直线交点法·主结果）= ({res['axis_xy'][0]:.1f}, {res['axis_xy'][1]:.1f}) mm"
         f"   |xy| = {np.hypot(*res['axis_xy']):.1f} mm")
     if "axis_xy_line" in res:

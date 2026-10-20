@@ -2,13 +2,16 @@
 """取放循环（一条命令跑到用户中断）。
 
 每轮：
-    起点=初始位姿(HOME)
-      ① 降到观察位(法兰 z=200, 保持 HOME 姿态) → 绕 J1 点拍 → 现场解出杯轴
-      ② 复核/刷新 CUP_XY → 重建环/杯模型与插入姿态
-      ③ 五段接近插入（复用 approach_cup.staged：每段过净空/限位/万向锁闸）
-      ④ 抬杯到「杯底离盒顶 50mm」→ 定格 5s
-      ⑤ 放回原位（下降→微降脱唇→径向撤出）
-      ⑥ 撤回初始位姿(HOME) → 定格 5s
+    起点=初始位姿(HOME)；2026-10-20 起 HOME 就定义在【观察高度 z=Z_OBS】，
+       所以每轮开头不再有"先下降到观察位"那一段，直接绕 J1 点拍 → 现场解出杯轴
+       （旧方案 HOME 在 z=248.3=示教位姿，每轮先降到 200；竖直总行程不变，
+        省的只是那 4 个航点的段切换/整定/到位检查，约 5~7s/轮）。
+    ① 绕 J1 点拍 → 现场解出杯轴
+    ② 复核/刷新 CUP_XY → 重建环/杯模型与插入姿态
+    ③ 五段接近插入（复用 approach_cup.staged：每段过净空/限位/万向锁闸）
+    ④ 抬杯到「杯底离盒顶 50mm」→ 定格 5s
+    ⑤ 放回原位（下降→微降脱唇→径向撤出）
+    ⑥ 撤回初始位姿(HOME) → 定格 5s
     重复。
 
 ⚠ 每条运动段都经 approach_cup.staged 的闸门（万向锁 GYM_HARD_DEG、环/杯净空 MIN_CLEAR、
@@ -23,6 +26,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import threading
@@ -57,8 +61,13 @@ Q_DEC = 2            # 规划起点关节量化到 2 位小数
 #     （fr_fkcache._key 用 :.4f）。若不量化，每次起点差一点点 ⇒ 整条轨迹错开 ⇒
 #     每轮凭空多出 ~900 个新位形、规划多花 ~95s。量化后「目标不变」的重复循环
 #     全部命中持久缓存，规划近乎瞬时（实测：同输入第二遍未命中 0）。
-HOME_POSE = np.asarray(config.HOME_POSE, float)
-HOME_JOINTS = np.asarray(config.HOME_JOINTS, float)
+HOME_TAUGHT = np.asarray(config.HOME_POSE, float)   # 示教位姿（z=248.3，仅参考）
+Z_HOME = Z_OBS                               # 2026-10-20：循环 HOME 改到观察高度
+#   ⚠ 为什么：观察位就是示教 HOME 沿 z 下降 48mm、保持同一姿态；把这个姿态直接当
+#     HOME，每轮开头省掉"①→观察位下降"那一段（4 航点的规划/整定/到位检查 ≈5~7s）。
+#     x/y/姿态仍沿用示教 HOME；config.HOME_POSE 本身不动（其它脚本的语义不变）。
+HOME_POSE = HOME_TAUGHT.copy()
+HOME_POSE[2] = Z_HOME
 
 
 def shoot(arm, cam, det, tag, patt):
@@ -85,8 +94,18 @@ def shoot(arm, cam, det, tag, patt):
     return {"T": T, "dets": dets, "tag": tag}
 
 
-def observe_localize(arm, cam, det, K, D, X, q_obs, outdir):
-    """在 q_obs 上绕 J1 点拍并解杯轴。返回 axis_xy（np.array）或 None。"""
+def observe_localize(arm, cam, det, K, D, X, q_obs, outdir, gate=None):
+    """在 q_obs 上绕 J1 点拍并解杯轴。返回 axis_xy（np.array）或 None。
+
+    gate：定位期间③①预规划线程可能正在发 FK；拍点之间的 MoveJ 也要过运动优先闸。
+    """
+    def _move(qt):
+        if gate is None:
+            arm.move_j(qt.tolist(), speed=SPEED, blocking=False)
+        else:
+            with gate.motion():
+                arm.move_j(qt.tolist(), speed=SPEED, blocking=False)
+
     shots = [shoot(arm, cam, det, "home", outdir)]
     for dq in TAPS:
         qt = q_obs.copy()
@@ -95,12 +114,12 @@ def observe_localize(arm, cam, det, K, D, X, q_obs, outdir):
         if bad:
             print("  跳过 " + bad)
             continue
-        arm.move_j(qt.tolist(), speed=SPEED, blocking=False)
+        _move(qt)
         if not wait_move(arm, 60):
             print("  观察点拍超时")
             break
         shots.append(shoot(arm, cam, det, f"J1{dq:+.0f}", outdir))
-        arm.move_j(q_obs.tolist(), speed=SPEED, blocking=False)
+        _move(q_obs)
         wait_move(arm, 60)
     res = cup_pose.solve_pnp(shots, K, D, X, say=lambda *a, **k: None)
     cup_pose.report_pnp(res)
@@ -154,11 +173,13 @@ def preplan_seg(*, fc, fk6, q_start, seg, tree, cup):
 
 
 def run_pipeline(arm, fc, fk6, lim, q_start, segs, tree, cup, hold_s, exec_fn=None,
-                 pre0=None):
+                 pre0=None, gate=None):
     """流水线【后台规划线程】：规划线程逐段算航点，主线程「算好一段就执行一段」。
 
     规划线程与主线程共用一条 RPC 连接（_LockedRpc 串行化）；运动期间主线程只轮询 :8083
     ⇒ 锁空闲 ⇒ 规划线程持续下发 FK ⇒ 规划与运动真正重叠（墙钟 ≈ max(规划, 运动)）。
+    gate：可选 RpcGate。主线程下发 MoveJ 时关闭闸门，规划线程暂停发 FK，避免在
+    控制器正要收运动指令时被后台查询抢占（2026-10-20 的 408 故障窗口）。
     pre0：(wps, plan_s) —— 第 0 段若已在【定位期间】预规划好就传入，规划线程从第 1 段起。
     返回 dict(trace, rng, plan_t, mov_t, times, t_wall, t_mov)。
     接触段跳过净空闸；任一段规划期净空不过 → 抛 RuntimeError。
@@ -201,7 +222,8 @@ def run_pipeline(arm, fc, fk6, lim, q_start, segs, tree, cup, hold_s, exec_fn=No
 
     def exec_seg(a, b):
         if exec_fn is None:
-            AC.replay(arm, lim, {"waypoints": trace}, a, b, times=times, quiet=True)
+            AC.replay(arm, lim, {"waypoints": trace}, a, b, times=times, quiet=True,
+                      gate=gate)
         else:
             exec_fn(a, b, None, times)
 
@@ -262,14 +284,63 @@ class _LockedRpc:
         return wrapped
 
 
+class RpcGate:
+    """运动指令优先闸：MoveJ 下发的那一刻，规划线程不得发新的 FK。
+
+    只锁「下发」这一瞬，不锁整个运动：等待到位期间规划线程照常跑，保留流水线的
+    重叠收益。另留 quiet_s 的安静窗口，避免 MoveJ 的响应刚回来、FK 就立刻压上去。
+
+    为什么需要：2026-10-20 一次真机 408 就发生在后台规划持续发 FK 的窗口里。
+    _LockedRpc 只保证串行，不保证「发运动指令时控制器是安静的」。
+    """
+
+    def __init__(self, quiet_s=0.05):
+        self._cv = threading.Condition()
+        self._busy = False
+        self._quiet_s = float(quiet_s)
+
+    def wait_idle(self):
+        with self._cv:
+            while self._busy:
+                self._cv.wait()
+
+    @contextlib.contextmanager
+    def motion(self):
+        with self._cv:
+            while self._busy:
+                self._cv.wait()
+            self._busy = True
+        try:
+            yield
+        finally:
+            if self._quiet_s > 0:
+                time.sleep(self._quiet_s)
+            with self._cv:
+                self._busy = False
+                self._cv.notify_all()
+
+
+def parse_cycles(argv):
+    """解析 --cycles N / --cycles=N / -cycles N / -cycles=N（单双横线都收）。
+
+    2026-10-20 实踩：文档写 --cycles，实际敲成 -cycles 时旧解析返回 None，
+    脚本进无限循环。这里统一剥掉前导横线再比。
+    """
+    for i, a in enumerate(argv):
+        name = a.lstrip("-")
+        if name.startswith("cycles="):
+            return int(name.split("=", 1)[1])
+        if name == "cycles":
+            return int(argv[i + 1])
+    return None
+
+
 def main():
     argv = sys.argv
     dry = "--dry" in argv
     sim = "--sim" in argv            # 流水线逻辑演练：规划照跑、运动用假执行器
     planonly = dry or sim
-    cycles = next((int(a.split("=", 1)[1]) for a in argv if a.startswith("--cycles=")), None)
-    if "--cycles" in argv:
-        cycles = int(argv[argv.index("--cycles") + 1])
+    cycles = parse_cycles(argv)
 
     arm = Arm()
     arm.connect()
@@ -278,7 +349,12 @@ def main():
         arm.r.set_mode(0)
     _rpc_lock = threading.Lock()
     arm.r = _LockedRpc(arm.r, _rpc_lock)      # 规划线程与主线程共用连接 ⇒ 调用串行化
-    fc = FKCache(arm.r.fk)
+    gate = RpcGate()                          # 运动指令优先：发 MoveJ 时暂停后台 FK
+    def _fk_rpc(q):
+        gate.wait_idle()
+        return arm.r.fk(q)
+
+    fc = FKCache(_fk_rpc)                     # 缓存命中不走网络，也就无需过闸
     M.attach_cache(fc)
     lim = np.asarray(V.set_limits(arm.r), float)
     fk6 = M.fk_throttled(lambda q: fc.pose(list(q)))
@@ -306,7 +382,7 @@ def main():
             stamp = time.strftime("%Y%m%d_%H%M%S")
             outdir = config.DATA_DIR / "cup_shots" / f"loop_{stamp}"
 
-            q = run_seg("①→观察位下降", [HOME_POSE[0], HOME_POSE[1], Z_OBS], Rh_home, q)
+            # HOME 已在观察高度（见 Z_HOME）⇒ 不再单开"下降"段，直接进入观察。
             q_obs = q.copy()
 
             # ③① 与杯子无关（在 HOME xy 竖直抬升）⇒ 可在【定位】期间就预规划，把它的规划藏进定位墙钟。
@@ -331,7 +407,8 @@ def main():
             else:
                 print("观察定位中…")
                 t_l0 = time.time()
-                axis_xy, res = observe_localize(arm, cam, det, K, D, X, q_obs, outdir)
+                axis_xy, res = observe_localize(arm, cam, det, K, D, X, q_obs, outdir,
+                                                gate=gate)
                 t_loc = time.time() - t_l0
                 if axis_xy is None:
                     print("✗ 本轮定位未过闸，停在观察位（不再运动）")
@@ -415,7 +492,8 @@ def main():
             try:
                 R = run_pipeline(arm, fc, fk6, lim, q_start, segs, tree, cup,
                                  0.0 if sim else HOLD_S,
-                                 exec_fn=sim_exec if sim else None, pre0=pre0)
+                                 exec_fn=sim_exec if sim else None, pre0=pre0,
+                                 gate=gate)
             except RuntimeError as e:
                 print(f"✗ {e} → 本轮中止（停在原地）")
                 break

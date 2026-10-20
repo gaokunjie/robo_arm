@@ -67,9 +67,13 @@ class _TimeoutTransport(xmlrpc.client.Transport):
     这里最初图省事每次 new 一个 HTTPConnection，几百次只读调用就是几百条 TCP 连接
     砸向嵌入式控制器（那次 :20003 和 :8083 两个服务随后同时拒绝连接）。
     下面这版照着基类抄，只多一个超时参数。
+
+    ⚠ 2026-10-20：**出错后必须扔掉这条连接**。控制器偶发 HTTP 408 时，响应和
+    请求可能已经错位；继续在旧 socket 上发下一条，会把一次瞬时故障放大成连续
+    超时。reset() 由 FRRpc.call 在非 Fault 异常后调用，下一条请求走全新连接。
     """
 
-    def __init__(self, timeout=3.0):
+    def __init__(self, timeout=6.0):
         super().__init__()
         self.timeout = timeout
 
@@ -83,17 +87,36 @@ class _TimeoutTransport(xmlrpc.client.Transport):
         _log_line("conn 新建")
         return self._connection[1]
 
+    def reset(self):
+        """关闭并丢弃缓存的 keep-alive 连接（出错恢复用）。"""
+        old, self._connection = self._connection, None
+        if old is not None:
+            try:
+                old[1].close()
+            except Exception:                                  # noqa: BLE001
+                pass
+            _log_line("conn 关闭（出错后重建）")
+
 
 class FRRpcError(RuntimeError):
-    pass
+    """RPC 失败。uncertain=True 表示「指令可能已经执行，但响应丢了」。
+
+    典型场景：HTTP 408 / socket 超时。此时**绝不能盲目重发**——先看机器人状态，
+    已到位就继续，没动才重发。Fault（机器人明确拒绝）是确定性的，不重试。
+    """
+
+    def __init__(self, msg, *, uncertain=False):
+        super().__init__(msg)
+        self.uncertain = bool(uncertain)
 
 
 class FRRpc:
-    def __init__(self, ip=None, timeout=3.0):
+    def __init__(self, ip=None, timeout=6.0):
         _log_open()
         self.ip = ip or config.ROBOT_IP
         self.url = f"http://{self.ip}:20003"
-        self._p = xmlrpc.client.ServerProxy(self.url, transport=_TimeoutTransport(timeout))
+        self._transport = _TimeoutTransport(timeout)
+        self._p = xmlrpc.client.ServerProxy(self.url, transport=self._transport)
 
     # ---------------- 底层 ----------------
     def call(self, name, *args):
@@ -111,10 +134,12 @@ class FRRpc:
                       f"Fault: {str(e.faultString)[:80]}")
             raise FRRpcError(f"{name} 被机器人拒绝: {e.faultString}") from e
         except Exception as e:
+            self._transport.reset()
             _LOG["n"] += 1
             _log_line(f"#{_LOG['n']:04d} {name}({arg_s}) {(time.monotonic() - t) * 1000:7.1f}ms "
                       f"ERR: {type(e).__name__}: {str(e)[:60]}")
-            raise FRRpcError(f"{name} 调用失败: {type(e).__name__}: {e}") from e
+            raise FRRpcError(
+                f"{name} 调用失败: {type(e).__name__}: {e}", uncertain=True) from e
 
     def _call_read(self, name, *args):
         """只读调用的重试退避：连接类错误（拒绝/重置/超时/断线）重试 3 次，间隔 0.5/1.5/3s。

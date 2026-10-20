@@ -17,5 +17,11 @@ FR_RPC_LOG*
 data/*.tmp
 data/fk_cache.*.tmp
 
+# 运行期生成物（截图批次）
+data/cup_shots/
+
+# 本地凭据
+key.txt
+
 # OS
 .DS_Store

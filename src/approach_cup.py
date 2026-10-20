@@ -54,6 +54,7 @@ import config                                              # noqa: E402
 import fr3_math as M                                       # noqa: E402
 from fr_arm import Arm                                      # noqa: E402
 from fr_fkcache import FKCache                             # noqa: E402
+from fr_rpc import FRRpcError                              # noqa: E402
 import verify_table_place as V                             # noqa: E402
 
 # ---------------- 场景常数 ----------------
@@ -355,7 +356,55 @@ def wait_move(arm, timeout=180.0, start_win=4.0, pump=None):
     return False
 
 
-def replay(arm, lim, plan, start=0, upto=None, times=None, pump=None, quiet=False):
+def move_j_checked(arm, q, pose, gate=None, label="航点", tol_deg=0.5):
+    """下发一条 MoveJ；通信超时后**先核对实际位置，必要时只重发一次**。
+
+    控制器偶发 HTTP 408 时，指令可能已经执行（2026-10-20 实测：408 后机械臂已走到
+    目标航点、error_code=0），只是响应丢了。盲目重发会造成两遍运动，直接放弃又会让
+    整轮白跑。这里的安全顺序是：
+        1. 等 8083 报告运动停稳（超时命令若没执行，也会在静止后返回）；
+        2. 回读关节，已在目标容差内 → 按成功继续；
+        3. 确认没动、无错误码/急停 → 用 call() 已重建的新连接重发同一目标一次。
+    Fault（机器人明确拒绝）是确定性错误，不进入本恢复路径。
+    """
+    def _send():
+        if gate is None:
+            arm.r.move_j([float(x) for x in q], [float(x) for x in pose],
+                         config.TOOL_ID, config.USER_ID, SPEED_PCT,
+                         config.MAX_ACC_PCT, 100.0, 0.0)
+        else:
+            with gate.motion():
+                arm.r.move_j([float(x) for x in q], [float(x) for x in pose],
+                             config.TOOL_ID, config.USER_ID, SPEED_PCT,
+                             config.MAX_ACC_PCT, 100.0, 0.0)
+
+    try:
+        _send()
+        return
+    except FRRpcError as e:
+        if not e.uncertain:
+            raise
+        print(f"  ⚠ {label} MoveJ 响应超时/连接异常：{e}")
+        print("  ↳ 不盲重发：先等运动停稳 → 回读关节 → 再决定")
+
+    if not wait_move(arm, 20.0):
+        raise RuntimeError(f"{label} 超时后 20s 仍未停稳，拒绝重发")
+    err = arm.errors().get("error_code")
+    if err not in (None, 0) or arm.estop_pressed():
+        raise RuntimeError(f"{label} 超时后机器人异常（error_code={err}，"
+                           f"急停={arm.estop_pressed()}），拒绝重发")
+
+    qa = np.asarray(arm.joint_deg(), float)
+    dj = float(np.max(np.abs(qa - np.asarray(q, float))))
+    if dj <= tol_deg:
+        print(f"  ↳ 实际关节差 {dj:.3f}° ≤ {tol_deg:.1f}°，判定已到位，继续")
+        return
+    print(f"  ↳ 实际关节差 {dj:.3f}° > {tol_deg:.1f}°，用新连接重发同一目标一次")
+    _send()
+
+
+def replay(arm, lim, plan, start=0, upto=None, times=None, pump=None, quiet=False,
+           gate=None):
     """【零 FK 回放】把一个算好的关节航点序列纯执行下去。
 
     —— 绕开控制器崩溃的要点：位姿随航点存好、直接喂 move_j（否则 fr_arm.move_j
@@ -366,6 +415,7 @@ def replay(arm, lim, plan, start=0, upto=None, times=None, pump=None, quiet=Fals
        到位，不含 0.4s 整定）。给调用方做「规划 vs 运动」计时用。
     pump：可选回调，透传 wait_move；供流水线在等运动时推进下一段规划。
     quiet：True 时不打印段末提示（流水线逐段回放时用）。
+    gate：可选「运动优先闸」；只包住 MoveJ 下发那一瞬，规划线程在此期间不得发 FK。
     """
     way = plan["waypoints"]
     end = len(way) if upto is None else min(int(upto), len(way))
@@ -391,9 +441,7 @@ def replay(arm, lim, plan, start=0, upto=None, times=None, pump=None, quiet=Fals
         if bad:
             sys.exit(bad)
         t_send = time.time()
-        arm.r.move_j([float(x) for x in q], [float(x) for x in w["pose"]],
-                     config.TOOL_ID, config.USER_ID, SPEED_PCT,
-                     config.MAX_ACC_PCT, 100.0, 0.0)
+        move_j_checked(arm, q, w["pose"], gate=gate, label=f"航点 #{idx}")
         if not wait_move(arm, 120, pump=pump):
             sys.exit(f"✗ 航点 #{idx} 等待到位超时，停在原地（别再发下一条！）")
         if times is not None:
